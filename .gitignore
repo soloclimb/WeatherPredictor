@@ -10,3 +10,4 @@ data/datasets/raw_data/
 *.env
 # Temporary Change to make project structure more clear 
 desktop/*
+.terraform/
