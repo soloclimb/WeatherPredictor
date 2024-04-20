@@ -3,4 +3,3 @@ variable "tasks_bucket_name" {
   nullable = false
   description = "Extraction tasks bucket name"
 }
-
