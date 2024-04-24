@@ -1,9 +1,10 @@
 import boto3
 import requests
 
-from json import loads, dumps
-from time import time, sleep
+from json import loads
 from datetime import datetime
+
+# from os import path
 
 # Tip from oficial Open Meteo Pricing page:
 # To calculate the number of API calls accurately,
@@ -50,8 +51,11 @@ def retrieve_from_open_meteo(link_params):
 #    "services": {
 #        "open_meteo": {
 #             "tasks": [{
-#                 "hourly_features": ["temperature_2m","relative_humidity_2m", "apparent_temperature","precipitation","rain","weather_code","surface_pressure","cloud_cover","wind_speed_10m","wind_direction_10m","soil_temperature_7_to_28cm"],
-#                 "daily_features": ["temperature_2m_max","temperature_2m_min","precipitation_hours"],
+#                 "hourly_features": ["temperature_2m","relative_humidity_2m", 
+#                                     "apparent_temperature","precipitation","rain","weather_code",
+#                                     "surface_pressure","cloud_cover","wind_speed_10m","wind_direction_10m","soil_temperature_7_to_28cm"],
+#                 "daily_features": ["temperature_2m_max",
+#                                    "temperature_2m_min","precipitation_hours"],
 #                 "latitude": "25.761681",
 #                 "longitude": "-80.191788",
 #                 "start_date": "2024-03-23",
@@ -84,6 +88,55 @@ def check_tasks_file_structure(s3_object):
     return file_content
 
 
+# Function that manages task - explained in note below
+# permission like 'events:PutRule' needs to be added for this lambda
+
+# Important note:
+#   rule_name of EventBus rule that triggers this lambda needs to be added,
+#   to adjust execution schedule,
+#   based on amount of tasks, amount of api requests left
+
+def change_schedule_rate(rule_name, new_rate):
+    cron_string = None
+    if new_rate == "default":
+        cron_string = "cron(5 0 * * ? *)"
+    elif new_rate == "frequent":
+        cron_string = "cron(0,30 * * * ? *)"
+
+    events = boto3.client("events")        
+
+    res = events.put_rule(
+            Name=rule_name,
+            ScheduleExpression=cron_string,
+            State='ENABLED'
+    )
+    
+    return {
+        "statusCode": 200,
+        "result": res
+    }
+
+
+# def load_raw_open_meteo(data, bucket_name, path_to_dir, task):
+#     s3 = boto3.resource("s3")
+#     bucket = s3.Bucket(bucket_name)
+    
+#     filename = ("start_date=" + task["start_date"] + 
+#                 "&end_date=" + task["end_date"])
+
+#     dirname = path.join(path_to_dir, ("latitude=" + task["latitude"] + 
+#                                       "&longitude=" + task["longitude"] + "/"))
+    
+#     full_filepath = path.join(dirname, filename + ".json")
+    
+#     matched_obj = list(bucket.objects.filter(Prefix=full_filepath))
+
+#     if len(matched_obj) > 0:
+#         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+#         full_filepath = (dirname + filename + "_version_"  
+#                          + timestamp + ".json")
+        
+
 def handler(event, context):
     s3 = boto3.client("s3")
     bucket_name = event["tasks_bucket"]
@@ -93,30 +146,39 @@ def handler(event, context):
     tasks_file_content = check_tasks_file_structure(s3_object)
    
     daily_left = event["daily_left"]
-    hourly_left = event["hourly_left"]
-    by_minute_left = event["by_minute_left"]
-    
-    prev_task_runtime = 0
+    hourly_allowed = event["hourly_allowed"]
+    by_minute_allowed = event["by_minute_allowed"]
 
     for service in tasks_file_content["services"].keys():
         if service == "open_meteo":
             for task in tasks_file_content["services"][service]["tasks"]:
                 
                 request_weight = calc_open_meteo_request_weight(task)
-                if request_weight > min([daily_left, 
-                                         hourly_left, by_minute_left]):
-                    if min([daily_left,
-                            hourly_left, by_minute_left]) == by_minute_left:
-                        
-                        sleep(60 - prev_task_runtime) if prev_task_runtime <= 60 else sleep(0)
+
+                minimal_requests = min([daily_left,
+                                        hourly_allowed,
+                                        by_minute_allowed])
+
+                if request_weight > minimal_requests:
+                    if minimal_requests == by_minute_allowed:
+                        #some notifier needed -  sns topic etc.
+                        print("request cannot be proccessed - request weight bigger that maximal allowed by minute", task)
+                        return
                     else:
                         print("Api requests limit reached!")
                         return
-                retrieve_from_open_meteo(task)
-                # load to raw s3 function
-                # implement logic for counting requests left
+                    
+                api_response = retrieve_from_open_meteo(task)
+                
+                daily_left -= request_weight
+                
+                # load function call or trigger 
+
+    # Decide what to do with raw data - trigger 
+    # instant transformation acccording response structure
+    # or store just json files in bucket 
+    # why it is bad - you don't know what parameters are inside 
+    # file, possibly if tasks repeated in scheduler - you store same info twice 
 
 
-# Ideas for raw data filenames
-# filename = "latitude=" + task["latitude"] + "&longitude=" + task["longitude"] + "&start_date=" + task["start_date"]+ "&end_date=" +task["end_date"] + ".json"
 
