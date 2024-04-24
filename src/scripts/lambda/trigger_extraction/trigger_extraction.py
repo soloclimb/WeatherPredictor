@@ -1,10 +1,10 @@
 import boto3
 import requests
 
-from json import loads
+from json import loads, dumps
 from datetime import datetime
 
-# from os import path
+from os import path
 
 # Tip from oficial Open Meteo Pricing page:
 # To calculate the number of API calls accurately,
@@ -117,27 +117,49 @@ def change_schedule_rate(rule_name, new_rate):
     }
 
 
-# def load_raw_open_meteo(data, bucket_name, path_to_dir, task):
-#     s3 = boto3.resource("s3")
-#     bucket = s3.Bucket(bucket_name)
+def load_raw_open_meteo(dct_data, bucket_name, task):
+    s3 = boto3.resource("s3")
+    bucket = s3.Bucket(bucket_name)
     
-#     filename = ("start_date=" + task["start_date"] + 
-#                 "&end_date=" + task["end_date"])
+    filename = ("start_date=" + task["start_date"] + 
+                "&end_date=" + task["end_date"])
 
-#     dirname = path.join(path_to_dir, ("latitude=" + task["latitude"] + 
-#                                       "&longitude=" + task["longitude"] + "/"))
+    dirname = path.join("/", ("latitude=" + task["latitude"] + 
+                              "&longitude=" + task["longitude"] + "/"))
     
-#     full_filepath = path.join(dirname, filename + ".json")
+    full_filepath = path.join(dirname, filename + ".json")
     
-#     matched_obj = list(bucket.objects.filter(Prefix=full_filepath))
+    matched_obj = list(bucket.objects.filter(Prefix=full_filepath))
 
-#     if len(matched_obj) > 0:
-#         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-#         full_filepath = (dirname + filename + "_version_"  
-#                          + timestamp + ".json")
-        
+    if len(matched_obj) > 0:
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        full_filepath = (dirname + filename + "_version_"  
+                         + timestamp + ".json")
+    
+    bucket.put_object(Bucket=bucket_name, Body=bytes(dumps(dct_data),
+                                                     encoding='utf-8'))
 
+
+def report_failure_to_sns(topic_arn, message):
+    sns = boto3.client("sns")
+
+    return sns.publish(
+        TopicArn=topic_arn,
+        Message=message
+    )
+    
+    
+# Function Must return how much requests are left for the day
 def handler(event, context):
+
+    # Next - add transitioon from default schedule to frequent 
+
+    scheduling_rule_name = event["scheduling_rule_name"]
+
+    failure_sns_topic_arn = event["failure_sns_topic_arn"]
+
+    raw_bucket_name = event["raw_bucket"]
+
     s3 = boto3.client("s3")
     bucket_name = event["tasks_bucket"]
     tasks_file_key = event["tasks_file_key"]    
@@ -146,39 +168,51 @@ def handler(event, context):
     tasks_file_content = check_tasks_file_structure(s3_object)
    
     daily_left = event["daily_left"]
-    hourly_allowed = event["hourly_allowed"]
     by_minute_allowed = event["by_minute_allowed"]
 
     for service in tasks_file_content["services"].keys():
+        
         if service == "open_meteo":
-            for task in tasks_file_content["services"][service]["tasks"]:
+            if len(tasks_file_content["services"][service]["tasks"]) == 0:
+                report_failure_to_sns(topic_arn=failure_sns_topic_arn,
+                                            message=("No tasks found in tasks file for open meteo"))
                 
-                request_weight = calc_open_meteo_request_weight(task)
+                change_schedule_rate(rule_name=scheduling_rule_name,
+                                     new_rate="default")
 
-                minimal_requests = min([daily_left,
-                                        hourly_allowed,
-                                        by_minute_allowed])
+            task = tasks_file_content["services"][service]["tasks"][0]
 
-                if request_weight > minimal_requests:
-                    if minimal_requests == by_minute_allowed:
-                        #some notifier needed -  sns topic etc.
-                        print("request cannot be proccessed - request weight bigger that maximal allowed by minute", task)
-                        return
-                    else:
-                        print("Api requests limit reached!")
-                        return
+            request_weight = calc_open_meteo_request_weight(task)
+
+            minimal_requests = min([daily_left,
+                                    by_minute_allowed])
+
+            if request_weight > minimal_requests:
+                if minimal_requests == by_minute_allowed:
+                    report_failure_to_sns(topic_arn=failure_sns_topic_arn,
+                                          message=("request for open meteo API cannot be proccessed - request weight: " +
+                                                   request_weight + " bigger that maximal allowed by minute" +
+                                                   by_minute_allowed))
+                    return
+                else:
+                    report_failure_to_sns(topic_arn=failure_sns_topic_arn,
+                                          message=("For service open meteo requests limit had been reached"))
+                
+                    change_schedule_rate(rule_name=scheduling_rule_name,
+                                         new_rate="default")
                     
-                api_response = retrieve_from_open_meteo(task)
+                    return
                 
-                daily_left -= request_weight
-                
-                # load function call or trigger 
+            api_response = retrieve_from_open_meteo(link_params=task)
+            
+            daily_left -= request_weight
 
-    # Decide what to do with raw data - trigger 
-    # instant transformation acccording response structure
-    # or store just json files in bucket 
-    # why it is bad - you don't know what parameters are inside 
-    # file, possibly if tasks repeated in scheduler - you store same info twice 
+            load_raw_open_meteo(dct_data=api_response,
+                                bucket_name=raw_bucket_name,
+                                task=task)
+                
+    return daily_left
+
 
 
 
