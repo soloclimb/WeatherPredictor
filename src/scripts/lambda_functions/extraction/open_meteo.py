@@ -3,7 +3,7 @@ import requests
 
 from json import loads, dumps
 from datetime import datetime
-
+from decimal import Decimal
 from os import path
 
 # Tip from oficial Open Meteo Pricing page:
@@ -13,25 +13,27 @@ from os import path
 # while 4 weeks of weather data count as 3.0 API calls.
 
 
-def calc_open_meteo_request_weight(link_params):
+def calc_request_weight(link_params):
     target_features = (link_params['hourly_features'] +
                        link_params["daily_features"])
 
-    features_weight = len(target_features) * 0.1
+    features_weight = Decimal(len(target_features)) * Decimal(0.1)
     start_date = datetime.strptime(link_params["start_date"], "%Y-%m-%d")
     end_date = datetime.strptime(link_params["end_date"], "%Y-%m-%d")
 
-    days_difference = end_date - start_date
-    weeks_difference = days_difference / 7
+    days_difference = (end_date - start_date).days
+    adjusted_days_difference = days_difference - 14
 
-    request_weight = (weeks_difference / 4) * 3 * features_weight
+    if adjusted_days_difference > 0: 
+        return round(float(Decimal(features_weight) + 
+                     Decimal(adjusted_days_difference) * Decimal(0.1)), 1)
+    else: 
+        return round(float(features_weight), 1)
 
-    return request_weight
 
-
-def retrieve_from_open_meteo(link_params):
+def retrieve_historical(link_params):
     for task in link_params["tasks"]:
-        url = f"https://archive-api.open-meteo.com/v1/archive?latitude={task['latitude']}&longitude={task['longitude']}&start_date={task['start_date']}&end_date={task['end_date']}&hourly={','.join(task['hourly_features'])}&daily={','.join(task['daily_features'])}&timezone={task['timezone']}&tilt={task['tilt']}"
+        url = f"https://archive-api.open-meteo.com/v1/archive?latitude={task['latitude']}&longitude={task['longitude']}&start_date={task['start_date']}&end_date={task['end_date']}&hourly={','.join(task['hourly_features'])}&daily={','.join(task['daily_features'])}&timezone={task['timezone']}"
         response = requests.get(url)
 
         return response.json()
@@ -61,29 +63,44 @@ def retrieve_from_open_meteo(link_params):
 #                 "start_date": "2024-03-23",
 #                 "end_date": "2024-03-26",
 #                 "timezone": "GMT",
-#                 "tilt": "5"
 #             }]
 #     }}
 # }
 
 
-def check_tasks_file_structure(s3_object):
+def check_tasks_file_structure(s3_object, extraction_topic_arn):
+    sns_client = boto3.client("sns")
+
     general_error_str = "File from tasks bucket must contain json file with appropriate structure, even if there's no current tasks!"
     
-    file_content = s3_object["Body"].read().decode("utf-8")
+    file_content = s3_object["Body"].decode("utf-8")
     
     if len(file_content) == 0:
-        raise ValueError(general_error_str, "len of file == 0")
+        msg = general_error_str + " len of file == 0"
+        sns_client.publish(
+            TopicArn=extraction_topic_arn,
+            Message=msg
+        )
+        raise ValueError(msg)
     
     file_content = loads(file_content)
 
     if "services" not in file_content:
-        raise ValueError(general_error_str, "'services' object not found")
+        msg = general_error_str + " 'services' object not found"
+        sns_client.publish(
+            TopicArn=extraction_topic_arn,
+            Message=msg
+        )
+        raise ValueError(msg)
 
-    for service in file_content["services"]:
-        if "tasks" not in service:
-            raise ValueError(general_error_str,
-                             "'tasks' object not found in service " + service)
+    for service in file_content["services"].keys():
+        if "tasks" not in file_content["services"][service].keys():
+            msg = general_error_str + " 'tasks' object not found in service " + service
+            sns_client.publish(
+                TopicArn=extraction_topic_arn,
+                Message=msg
+            )
+            raise ValueError(msg)
 
     return file_content
 
@@ -103,8 +120,7 @@ def change_schedule_rate(rule_name, new_rate):
     elif new_rate == "frequent":
         cron_string = "cron(0,30 * * * ? *)"
 
-    events = boto3.client("events")        
-
+    events = boto3.client("events")
     res = events.put_rule(
             Name=rule_name,
             ScheduleExpression=cron_string,
@@ -117,7 +133,7 @@ def change_schedule_rate(rule_name, new_rate):
     }
 
 
-def load_raw_open_meteo(dct_data, bucket_name, task):
+def load_raw(dct_data, bucket_name, task):
     s3 = boto3.resource("s3")
     bucket = s3.Bucket(bucket_name)
     
@@ -175,14 +191,14 @@ def handler(event, context):
         if service == "open_meteo":
             if len(tasks_file_content["services"][service]["tasks"]) == 0:
                 report_failure_to_sns(topic_arn=failure_sns_topic_arn,
-                                            message=("No tasks found in tasks file for open meteo"))
+                                      message=("No tasks found in tasks file for open meteo"))
                 
                 change_schedule_rate(rule_name=scheduling_rule_name,
                                      new_rate="default")
 
             task = tasks_file_content["services"][service]["tasks"][0]
 
-            request_weight = calc_open_meteo_request_weight(task)
+            request_weight = calc_request_weight(task)
 
             minimal_requests = min([daily_left,
                                     by_minute_allowed])
@@ -203,16 +219,12 @@ def handler(event, context):
                     
                     return
                 
-            api_response = retrieve_from_open_meteo(link_params=task)
+            api_response = retrieve_historical(link_params=task)
             
             daily_left -= request_weight
 
-            load_raw_open_meteo(dct_data=api_response,
-                                bucket_name=raw_bucket_name,
-                                task=task)
+            load_raw(dct_data=api_response,
+                     bucket_name=raw_bucket_name,
+                     task=task)
                 
     return daily_left
-
-
-
-
