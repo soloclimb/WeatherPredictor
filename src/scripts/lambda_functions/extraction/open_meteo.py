@@ -13,13 +13,36 @@ from os import path
 # while 4 weeks of weather data count as 3.0 API calls.
 
 
-def calc_request_weight(link_params):
-    target_features = (link_params['hourly_features'] +
-                       link_params["daily_features"])
+def calc_request_weight(task, extraction_topic_arn):
+    if not isinstance(task, dict): 
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message="Provided task object in calc_request_weight() is not valid type: " + task)
 
+    hourly_features = task.get('hourly_features', [])
+    daily_features = task.get('daily_features', [])
+
+    target_features = hourly_features + daily_features
+
+    if not all(isinstance(feature, str) for feature in target_features):
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message="Invalid data format in calc_request_weight(): Features should be arrays of strings.")
+               
     features_weight = Decimal(len(target_features)) * Decimal(0.1)
-    start_date = datetime.strptime(link_params["start_date"], "%Y-%m-%d")
-    end_date = datetime.strptime(link_params["end_date"], "%Y-%m-%d")
+
+    try:
+        start_date = datetime.strptime(task["start_date"], "%Y-%m-%d")
+    except ValueError as e:
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message="Invalid date format in calc_request_weight(): " +
+                              task["start_date"] + " . Expected format is 'YYYY-MM-DD'." +
+                              str(e))
+    try:
+        end_date = datetime.strptime(task["end_date"], "%Y-%m-%d")
+    except ValueError as e:
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message="Invalid date format in calc_request_weight(): " + 
+                              task["end_date"]+ " . Expected format is 'YYYY-MM-DD'." +
+                              str(e))
 
     days_difference = (end_date - start_date).days
     adjusted_days_difference = days_difference - 14
@@ -31,12 +54,19 @@ def calc_request_weight(link_params):
         return round(float(features_weight), 1)
 
 
-def retrieve_historical(link_params):
-    for task in link_params["tasks"]:
+def retrieve_historical(retrieval_tasks, extraction_topic_arn):
+    for task in retrieval_tasks["tasks"]:
         url = f"https://archive-api.open-meteo.com/v1/archive?latitude={task['latitude']}&longitude={task['longitude']}&start_date={task['start_date']}&end_date={task['end_date']}&hourly={','.join(task['hourly_features'])}&daily={','.join(task['daily_features'])}&timezone={task['timezone']}"
         response = requests.get(url)
-
-        return response.json()
+        if response.status_code == 200:
+            return response.json()
+        else:
+            msg = ("Get request by url: " + url + "Status code: " + 
+                   str(response.status_code) + "Reason: " + response.reason + " " +
+                   str(response.json()))
+            
+            report_failure_to_sns(topic_arn=extraction_topic_arn,
+                                  message=msg)
 
 # Tasks file must follow json structure:
 # services: {
@@ -69,37 +99,29 @@ def retrieve_historical(link_params):
 
 
 def check_tasks_file_structure(s3_object, extraction_topic_arn):
-    sns_client = boto3.client("sns")
-
     general_error_str = "File from tasks bucket must contain json file with appropriate structure, even if there's no current tasks!"
     
     file_content = s3_object["Body"].decode("utf-8")
     
     if len(file_content) == 0:
         msg = general_error_str + " len of file == 0"
-        sns_client.publish(
-            TopicArn=extraction_topic_arn,
-            Message=msg
-        )
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message=msg)
         raise ValueError(msg)
     
     file_content = loads(file_content)
 
     if "services" not in file_content:
         msg = general_error_str + " 'services' object not found"
-        sns_client.publish(
-            TopicArn=extraction_topic_arn,
-            Message=msg
-        )
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message=msg)
         raise ValueError(msg)
 
     for service in file_content["services"].keys():
         if "tasks" not in file_content["services"][service].keys():
             msg = general_error_str + " 'tasks' object not found in service " + service
-            sns_client.publish(
-                TopicArn=extraction_topic_arn,
-                Message=msg
-            )
+            report_failure_to_sns(topic_arn=extraction_topic_arn,
+                                  message=msg)
             raise ValueError(msg)
 
     return file_content
