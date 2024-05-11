@@ -135,7 +135,7 @@ def check_tasks_file_structure(s3_object, extraction_topic_arn):
 #   to adjust execution schedule,
 #   based on amount of tasks, amount of api requests left
 
-def change_schedule_rate(rule_name, new_rate):
+def change_schedule_rate(rule_name, new_rate, extraction_topic_arn):
     cron_string = None
     if new_rate == "default":
         cron_string = "cron(5 0 * * ? *)"
@@ -148,34 +148,49 @@ def change_schedule_rate(rule_name, new_rate):
             ScheduleExpression=cron_string,
             State='ENABLED'
     )
-    
-    return {
-        "statusCode": 200,
-        "result": res
-    }
+    res_status_code = res['ResponseMetadata']['HTTPStatusCode'] 
+    if res_status_code == 200:
+        return {
+            "statusCode": 200,
+            "result": res
+        }
+    elif res_status_code == 400 or res_status_code == 500:
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message="Error occured in change_schedule_rate(): " + 
+                              res['Error']['Message'])
+        return {"statusCode": res_status_code,
+                "message": res['Error']['Message'],
+                "type": res['Error']['Type'],
+                "result": res}
 
 
-def load_raw(dct_data, bucket_name, task):
-    s3 = boto3.resource("s3")
-    bucket = s3.Bucket(bucket_name)
-    
-    filename = ("start_date=" + task["start_date"] + 
-                "&end_date=" + task["end_date"])
+def load_raw(dct_data, bucket_name,
+             task, extraction_topic_arn):
+    try:
+        s3 = boto3.resource("s3")
+        bucket = s3.Bucket(bucket_name)
+        
+        filename = ("start_date=" + task["start_date"] + 
+                    "&end_date=" + task["end_date"])
 
-    dirname = path.join("/", ("latitude=" + task["latitude"] + 
-                              "&longitude=" + task["longitude"] + "/"))
-    
-    full_filepath = path.join(dirname, filename + ".json")
-    
-    matched_obj = list(bucket.objects.filter(Prefix=full_filepath))
+        dirname = path.join("/", ("latitude=" + task["latitude"] + 
+                                "&longitude=" + task["longitude"] + "/"))
+        
+        full_filepath = path.join(dirname, filename + ".json")
+        
+        matched_obj = list(bucket.objects.filter(Prefix=full_filepath))
 
-    if len(matched_obj) > 0:
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        full_filepath = (dirname + filename + "_version_"  
-                         + timestamp + ".json")
-    
-    bucket.put_object(Bucket=bucket_name, Body=bytes(dumps(dct_data),
-                                                     encoding='utf-8'))
+        if len(matched_obj) > 0:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            full_filepath = (dirname + filename + "_version_"  
+                            + timestamp + ".json")
+        
+        res = bucket.put_object(Bucket=bucket_name, Body=bytes(dumps(dct_data),
+                                                         encoding='utf-8'))
+        return res
+    except Exception as e:
+        report_failure_to_sns(topic_arn=extraction_topic_arn,
+                              message="Error occured in load_raw(): " + str(e))
 
 
 def report_failure_to_sns(topic_arn, message):
